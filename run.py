@@ -272,6 +272,12 @@ class CustomArguments:
             )
         }
     )
+    adapter_dir: Optional[str] = field(
+        default=None,
+    )
+    retrieval_stride: int = field(
+        default=16,
+    )
     def __post_init__(self):
         '''Check'''
         if self.context_type not in ['vanilla_incontext', 'marking_incontext']:
@@ -329,27 +335,19 @@ class Custom_trainer(Trainer):
         }
         outputs = model(**model_inputs)
         logits = outputs.logits  # shape of logits: [batch_size, seq_len, vocab_size]
-
         loss_fnt = CrossEntropyLoss(reduction='none')
-        loss = []
         bsz = logits.size(0)
-        for batch_id in range(0,bsz):
-            st = inputs['tgt_st'][batch_id]  # start of target 
-            ed = inputs['tgt_ed'][batch_id]  # end of target
 
-            if self.custom_args.context_type == 'marking_incontext':
-                # Ideally, marking tokens will not be predicted, therefore remove them from the loss computation.
-                loss_input = logits[batch_id, st-1:ed-1, :-2]
-            elif self.custom_args.context_type == "vanilla_incontext":
-                loss_input = logits[batch_id, st-1:ed-1]
-            else:
-                raise ValueError("No implementation.")
-            
-            loss_target = inputs['input_ids'][batch_id][st:ed]    
-            # Next toekn prediction loss function: [st-1, ed-1]->[st, ed]
-            cur_loss = loss_fnt(input=loss_input, target=loss_target)
-            loss.append(cur_loss)
-        loss = torch.cat(loss).mean()
+        if self.custom_args.context_type == 'marking_incontext':
+            loss_input = logits[:, :-1, :-2].contiguous()
+        elif self.custom_args.context_type == "vanilla_incontext":
+            loss_input = logits[:, :-1].contiguous()
+        else:
+            raise ValueError("No implementation.")
+        labels = inputs["labels"][:, 1:].long().contiguous()
+        loss = loss_fnt(input=loss_input.view(-1, loss_input.size(-1)), target=labels.view(-1))
+        loss = loss.sum() / (self.custom_args.retrieval_stride * bsz)
+        
         return (loss, outputs) if return_outputs else loss
 
     def prediction_step(
@@ -570,7 +568,7 @@ def main():
             
         elif training_args.do_eval:
             # Load lora checkpoint from an exist path.
-            model = PeftModel.from_pretrained(model, model_args.model_name_or_path)
+            model = PeftModel.from_pretrained(model, custom_args.adapter_dir)
             model.print_trainable_parameters()
     
     # logger.info(f"CUDA memory: {torch.cuda.memory_allocated()/ 1024 / 1024 / 1024}G")
@@ -579,6 +577,7 @@ def main():
         if "train" not in lm_datasets:
             raise ValueError("--do_train requires a train dataset")
         train_dataset = lm_datasets["train"]
+        train_dataset = train_dataset.shuffle()
         if data_args.max_train_samples is not None:
             max_train_samples = min(len(train_dataset), data_args.max_train_samples)
             train_dataset = train_dataset.select(range(max_train_samples))
@@ -587,6 +586,7 @@ def main():
         if "validation" not in lm_datasets:
             raise ValueError("--do_eval requires a test dataset")
         eval_dataset = lm_datasets["validation"]
+        eval_dataset = eval_dataset.shuffle()
         if data_args.max_eval_samples is not None:
             max_eval_samples = min(len(eval_dataset), data_args.max_eval_samples)
             eval_dataset = eval_dataset.select(range(max_eval_samples))
@@ -595,32 +595,34 @@ def main():
         if not isinstance(features[0], Mapping):
             features = [vars(f) for f in features]
         #keys of features: "e", "src", "tgt"
-        input_ids, attention_mask, tgt_st, tgt_ed = [], [], [], []
+        input_ids, attention_mask, labels = [], [], []
         for feature in features:
             # Concatenate source and target to construct data
             # Save the start and end positon of target in context for loss function.
+            if len(feature["src"]) == 0:
+                raise ValueError(f"{feature}")
             if custom_args.add_position == "none":
                 input_ids.append(feature["src"] + feature["tgt"])
-                tgt_st.append(len(feature["src"]))
-                tgt_ed.append(len(feature["src"])+ len(feature["tgt"]))
+                labels.append([-100] * len(feature["src"]) + feature["tgt"])
             else:
+                if custom_args.context_type == "marking_incontext":
+                    feature["e"] = [MARK_L_TOKEN] + feature["e"] + [MARK_R_TOKEN]
                 if custom_args.add_position == "back":
                     input_ids.append(feature["src"] + feature["e"] + feature["tgt"])
                 elif custom_args.add_position == "front":
                     input_ids.append(feature["e"] + feature["src"] + feature["tgt"])
-                tgt_st.append(len(feature["src"]) + len(feature["e"]))
-                tgt_ed.append(len(feature["src"]) + len(feature["e"])+ len(feature["tgt"]))
+                labels.append([-100] * (len(feature["e"]) + len(feature["src"])) + feature["tgt"])
         
         maxl = max(len(_) for _ in input_ids)
         for i in range(len(input_ids)):
             input_ids[i] = input_ids[i] + [0] * (maxl - len(input_ids[i]))
+            labels[i] = labels[i] + [-100] * (maxl - len(labels[i]))
             attention_mask.append([1] * len(input_ids[i]) + [0] * (maxl - len(input_ids[i])))
 
         batch = {
             "input_ids": torch.tensor(input_ids),
             "attention_mask": torch.tensor(attention_mask),
-            "tgt_st": tgt_st,
-            "tgt_ed": tgt_ed
+            "labels": torch.tensor(labels),
         }
         return batch
     

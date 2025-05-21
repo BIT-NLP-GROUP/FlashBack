@@ -1,0 +1,11 @@
+python data_prepare.py \
+    --dataset_dir $DATASET_DIR \
+    --model_dir $MODEL_DIR \
+    --index_dir $INDEX_DIR \
+    --save_dir $SAVE_DIR \
+    --retrieve_stride 16 \
+    --forbid_titles_dir $FORBID_TITLES_DIR \
+    --train_split $TRAIN_SPLIT \
+    --validation_split $VALIDATION_SPLIT \
+    --max_pos_embeddings 512 \
+    --recall_max_width 128

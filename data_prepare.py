@@ -21,43 +21,20 @@ class PrepareArguments:
     recall_max_width: int = field(default=256,metadata={"help":("Used to truncate retrieved content."),})
     retrieve_k: int = field(default=1,metadata={"help":("Concatenate `k` retrieved content."),})
     retrieve_stride: int = field(default=32)
-    context_type: str = field(default=None)
     save_dir: str=field(default=None)
     forbid_titles_dir: str=field(default=None, metadata={"help":("Used to filter out documents by titles"),})
-    splits: list[str]=field(default=None)
-    construct_type: str=field(
-        default=None,
-        metadata={
-            "help": (
-                "There are two construction of data, one is `random`, another is `default`."
-                "`random` will sample from a distribution as the positon of target"
-                "While `default` use the suffix of max sequence length as the position of target"
-            )
-        }
-    )
+    train_split: str=field(default=None)
+    validation_split: str=field(default=None)
     max_pos_embeddings: int=field(default=None)
-    max_train_example: int=field(
-        default=None,
-        metadata={
-            "help": (
-                "Using how many examples when construct train dataset."
-                "Being Set to `None` refers to use full data."
-                "(Just for accelerate data preparing."
-            )
-        }
-    )
+    split_batch_size: int=field(default=1000)
+    retrieve_batch_size: int=field(default=1000)
+    is_pile: bool=field(default=False)
+
+    seed: int=field(default=42)
 
     def __post_init__(self):
-
         if self.dataset_dir is None:
             raise ValueError('--dataset_dir error.')
-        for _ in self.splits: 
-            if _ not in ["train","validation","test"]:
-                raise ValueError(f"{_} is not a legal split.")
-        if self.context_type not in ['vanilla_incontext', 'marking_incontext']:
-            raise ValueError('--context_type error.')
-        if self.construct_type not in ["random", "default"]:
-            raise ValueError("--construct_type error.")
         
         if self.forbid_titles_dir is not None:
             with open(self.forbid_titles_dir, "r") as fp:
@@ -75,19 +52,16 @@ class PrepareArguments:
             "recall_max_width": self.recall_max_width,
             "retrieve_k": self.retrieve_k,
             "retrieve_stride": self.retrieve_stride,
-            "context_type": self.context_type,
-            "forbid_titles_dir":self.forbid_titles_dir,
-            "splits":self.splits,
-            "construct_type": self.construct_type,
+            "forbid_titles_dir": self.forbid_titles_dir,
+            "train_split": self.train_split,
+            "validation_split": self.validation_split,
             "max_pos_embeddings": self.max_pos_embeddings,
-            "max_train_example": self.max_train_example
+            "seed": self.seed,
+            "is_pile": self.is_pile
         }
 
-MARK_L = '<MARK_L>'
-MARK_R = '<MARK_R>'
-
 def main():
-    set_seed(42)
+    
     parser = HfArgumentParser(PrepareArguments)
 
     args = parser.parse_args_into_dataclasses()[0]
@@ -105,12 +79,10 @@ def main():
             print("No change.")
             return
     print(args)
+    set_seed(args.seed)
     dataset = load_from_disk(args.dataset_dir)
     
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
-    if args.context_type == "marking_incontext":
-        tokenizer.add_tokens([MARK_L, MARK_R], special_tokens=False)
-        MARK_L_TOKEN, MARK_R_TOKEN = tokenizer.convert_tokens_to_ids([MARK_L, MARK_R])
     
     config = AutoConfig.from_pretrained(args.model_dir)
     if args.max_pos_embeddings is not None:
@@ -122,69 +94,73 @@ def main():
             max_pos_embeddings = config.n_positions
         else:
             raise ValueError("No implementation.")
-    
-    searcher = LuceneSearcher(args.index_dir)
 
-    splits = args.splits
-    for split in splits:
-        if not (split in dataset.keys()): continue
+    searcher = LuceneSearcher(args.index_dir)
+    if not os.path.exists(args.save_dir + '/dataset'):
+        os.makedirs(args.save_dir + '/dataset')
+    for split in ["train", "validation"]:
+        if split == "train":
+            if args.train_split is None: continue
+            else: new_split = args.train_split
+        if split == "validation":
+            if args.validation_split is None: continue
+            else: new_split = args.validation_split
         print(f"process `{split}` spilt...")
 
         split_dir = args.save_dir + '/dataset/' + split + '.jsonl'
-        raw_data = "".join([x["text"] if x["text"] else " \n" for x in dataset[split]])
-        tokens = tokenizer(raw_data).input_ids  
+        with jsonlines.open(split_dir, 'w') as fp:
+            start_position, end_position = 0, len(dataset[new_split])
+            if split == "train" and args.is_pile:
+                start_position = int(len(dataset[new_split]) * 0.8)
+                end_position = int(len(dataset[new_split]) * 0.9)
+            elif split == "validation" and args.is_pile:
+                start_position = int(len(dataset[new_split]) * 0.9)
+            for batch_pos in tqdm(range(start_position, end_position, args.split_batch_size)):
+                raw_data = dataset[new_split][batch_pos: batch_pos + args.split_batch_size]["text"]
+                raw_data = "".join([x if x else " \n" for x in raw_data])
+                tokens = tokenizer(raw_data).input_ids 
+                queries, pos = [], []
 
-        with jsonlines.open(split_dir, 'w') as fp:            
-            queries, pos = [], []
-            for i in range(max_pos_embeddings, len(tokens), args.retrieve_stride):
-                if i + args.retrieve_stride >= len(tokens): break
-                query = tokenizer.decode(tokens[i - args.search_max_width: i])
-                queries.append(query)
-                pos.append(i)
-                if split == "train" and args.max_train_example is not None:
-                    if len(queries) >= args.max_train_example:
-                        break
-
-            recalls = searcher.batch_search(
-                queries,
-                qids=[str(i) for i in range(len(queries))],
-                k=args.retrieve_k * 2, # times 2 avoiding the number of recall is less than `k` due to retrieval
-                threads=multiprocessing.cpu_count()
-            )
-            for qid, res in tqdm(recalls.items()):
-                i = int(qid)
-                allowed_docs = []
-                for hit in res:
-                    res_dict = json.loads(hit.raw)
-                    docs = res_dict['contents']
-
-                    title = docs.split("\n")[0]
-                    if title.startswith('"') and title.endswith('"'): title = title[1:-1]
-                    if title in args.forbid_titles: continue
-
-                    allowed_docs.append(docs)
-                    if len(allowed_docs) >= args.retrieve_k:
-                        break
-                retrieved = []
-                for docs in allowed_docs:
-                    if args.context_type == "marking_incontext":
-                        retrieved = retrieved + [MARK_L_TOKEN] + tokenizer(docs).input_ids[:args.recall_max_width] + [MARK_R_TOKEN]
-                    else:
-                        retrieved = retrieved + tokenizer(docs).input_ids[:args.recall_max_width]
-                target = tokens[pos[i]: pos[i] + args.retrieve_stride]
+                for i in range(max_pos_embeddings, len(tokens), args.retrieve_stride):
+                    if i + args.retrieve_stride >= len(tokens): break
+                    query = tokenizer.decode(tokens[i - args.search_max_width: i])
+                    queries.append(query)
+                    pos.append(i)
                 
-                if args.construct_type == "random":
-                    center_pos = random.randint(max_pos_embeddings // 2, max_pos_embeddings - args.retrieve_stride - 1)
-                    source = tokens[pos[i] - center_pos + len(retrieved): pos[i]]
-                else: # args.construct_type = "default"
-                    source = tokens[pos[i] - max_pos_embeddings + len(retrieved) + args.retrieve_stride: pos[i]]
-                    if len(retrieved) + len(source) + len(target) != max_pos_embeddings:
-                        raise ValueError(f"defalut construct error: {len(retrieved) + len(source) + len(target)} != {max_pos_embeddings}.")
-                fp.write({
-                    "e": retrieved,
-                    "src": source,
-                    "tgt": target
-                })
+                for i in range(0, len(queries), args.retrieve_batch_size):
+                    queries_batch = queries[i: i+args.retrieve_batch_size]
+
+                    recalls = searcher.batch_search(
+                        queries_batch,
+                        qids=[str(j) for j in range(len(queries_batch))],
+                        k=args.retrieve_k * 2, # times 2 avoiding the number of recall is less than `k` due to retrieval
+                        threads=multiprocessing.cpu_count()
+                    )
+                    for qid, res in recalls.items():
+                        j = i + int(qid)
+                        retrieved_docs_tokens = []
+                        num_retrieved_docs = 0
+                        for hit in res:
+                            res_dict = json.loads(hit.raw)
+                            docs = res_dict['contents']
+                            if args.forbid_titles is not None:
+                                title = docs.split("\n")[0]
+                                if title.startswith('"') and title.endswith('"'): title = title[1:-1]
+                                if title in args.forbid_titles: continue
+                            retrieved_docs_tokens = retrieved_docs_tokens + tokenizer(docs).input_ids[:args.recall_max_width]
+                            num_retrieved_docs = num_retrieved_docs + 1
+                            if num_retrieved_docs >= args.retrieve_k:
+                                break
+                        target = tokens[pos[j]: pos[j] + args.retrieve_stride]
+                        center_pos = random.randint(max_pos_embeddings // 2, max_pos_embeddings - args.retrieve_stride - 1)
+                        source = tokens[pos[j] - center_pos + len(retrieved_docs_tokens): pos[j]]
+                        if len(source) == 0:
+                            raise ValueError(f"{len(retrieved_docs_tokens), pos[j], center_pos, max_pos_embeddings, num_retrieved_docs }")
+                        fp.write({
+                            "e": retrieved_docs_tokens,
+                            "src": source,
+                            "tgt": target
+                        })
     with open(args.save_dir + '/args.json', 'w') as fp:
         json.dump(args.dict, fp=fp)
     print("Finish.")
