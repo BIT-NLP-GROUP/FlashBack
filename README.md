@@ -137,3 +137,18 @@ python test_multiple_k.py \
     --add_position back \
     --retrieve_k $RETRIEVE_K
 ```
+
+## Citation:
+
+If you find our work helpful, please cite our paper:
+
+```bibtex
+@misc{liu2025flashbackefficientretrievalaugmentedlanguagemodeling,
+  title     = {FlashBack: Efficient Retrieval-Augmented Language Modeling for Long Context Inference},
+  author    = {Runheng Liu and Xingchen Xiao and Heyan Huang and Zewen Chi and Zhijing Wu},
+  year      = {2025},
+  eprint    = {2405.04065},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.CL},
+  url       = {https://arxiv.org/abs/2405.04065}
+}
